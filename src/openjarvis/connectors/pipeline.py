@@ -94,11 +94,6 @@ class IngestionPipeline:
         self._chunker = SemanticChunker(max_tokens=max_tokens)
         self._attachment_store = attachment_store
         self._embedder = embedder
-        # Within-instance dedup only. Documents already in the store are
-        # not preloaded here: they are re-chunked and compared hash-for-hash
-        # against the stored rows in ``ingest()`` so an edited file gets
-        # rewritten instead of silently kept stale.
-        self._seen_doc_ids: set[str] = set()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -145,8 +140,9 @@ class IngestionPipeline:
     def ingest(self, documents: Iterable[Document]) -> int:
         """Ingest an iterable of documents into the knowledge store.
 
-        Duplicate ``doc_id`` values are silently skipped (both across
-        calls and within a single batch).
+        Duplicate ``doc_id`` values within a call are skipped. Documents
+        already in the store are compared by chunk hash: unchanged documents
+        are skipped, while edited documents are rewritten.
 
         Parameters
         ----------
@@ -160,9 +156,13 @@ class IngestionPipeline:
             The total number of chunks written to the store in this call.
         """
         chunks_stored = 0
+        # Keep dedup local to this call. A long-lived pipeline is reused by
+        # SyncEngine/SyncScheduler across syncs, where a previously seen
+        # document may now contain edits that need hash comparison below.
+        seen_doc_ids: set[str] = set()
 
         for doc in documents:
-            if doc.doc_id in self._seen_doc_ids:
+            if doc.doc_id in seen_doc_ids:
                 continue
 
             # Compute v1 provenance fields once per document.
@@ -210,7 +210,7 @@ class IngestionPipeline:
             existing_hashes = self._store.chunk_hashes(doc.doc_id, source_id)
             if existing_hashes:
                 if existing_hashes == new_hashes:
-                    self._seen_doc_ids.add(doc.doc_id)
+                    seen_doc_ids.add(doc.doc_id)
                     continue
                 self._store.delete(doc.doc_id)
 
@@ -297,7 +297,7 @@ class IngestionPipeline:
                             )
                             chunks_stored += 1
 
-            self._seen_doc_ids.add(doc.doc_id)
+            seen_doc_ids.add(doc.doc_id)
 
         return chunks_stored
 
